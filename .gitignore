@@ -1,0 +1,23 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Environment files
+.env
+
+# Generated outputs
+audio/
+frames/
+transcripts/
+notes/
+
+# Large input videos
+videos/
+*.mp4
+*.mov
+*.mkv
+*.wav
+
+# Mac files
+.DS_Store
