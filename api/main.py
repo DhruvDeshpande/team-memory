@@ -1,5 +1,6 @@
 from pathlib import Path
 import shutil
+import subprocess
 
 from fastapi import FastAPI, UploadFile, File
 
@@ -18,13 +19,20 @@ def home():
 
 @app.post("/transcribe")
 async def transcribe_video(file: UploadFile = File(...)):
+    # Save uploaded video
     save_path = VIDEOS_DIR / file.filename
 
     with save_path.open("wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
 
+    # Run the processing pipeline
+    subprocess.run(
+        ["python3", "scripts/process_video.py"],
+        check=True
+    )
+
     return {
         "filename": file.filename,
         "saved_to": str(save_path),
-        "status": "video uploaded and saved successfully"
+        "status": "video processed successfully"
     }
