@@ -3,12 +3,22 @@ from datetime import date
 from pathlib import Path
 import subprocess
 import sys
+import time
 
 from faster_whisper import WhisperModel
 
 
 # Set up the paths used by this script.
 DEFAULT_INPUT_VIDEO = Path("videos/sample_meeting.mp4")
+
+# Change this number if you want more or fewer frames.
+# For example, 5 means "save one frame every 5 seconds."
+FRAME_INTERVAL_SECONDS = 5
+
+# Change this if you want to use a different Faster Whisper model.
+# "base" is a good beginner-friendly default.
+WHISPER_MODEL = "base"
+
 AUDIO_FOLDER = Path("audio")
 FRAMES_FOLDER = Path("frames")
 TRANSCRIPTS_FOLDER = Path("transcripts")
@@ -28,10 +38,16 @@ def format_timestamp(seconds):
     return f"{hours:02d}:{minutes:02d}:{remaining_seconds:02d}"
 
 
-def get_nearest_frame(start_seconds, total_frames, video_frames_folder):
-    # Frames are extracted every 5 seconds.
-    # 0-4 seconds use frame_0001.jpg, 5-9 seconds use frame_0002.jpg, and so on.
-    calculated_frame_number = int(start_seconds // 5) + 1
+def get_nearest_frame(
+    start_seconds,
+    total_frames,
+    video_frames_folder,
+    frame_interval_seconds,
+):
+    # Frames are extracted at a configurable interval.
+    # If the interval is 5, 0-4 seconds use frame_0001.jpg,
+    # 5-9 seconds use frame_0002.jpg, and so on.
+    calculated_frame_number = int(start_seconds // frame_interval_seconds) + 1
 
     # If the transcript goes past the final extracted frame, use the last frame instead.
     frame_number = min(calculated_frame_number, total_frames)
@@ -40,12 +56,22 @@ def get_nearest_frame(start_seconds, total_frames, video_frames_folder):
 
 
 def main():
+    # Start a timer for the whole video processing pipeline.
+    total_start_time = time.perf_counter()
+
     # Use the video path from the command line if one was provided.
     # Otherwise, use the default sample meeting video.
     if len(sys.argv) > 1:
         input_video = Path(sys.argv[1])
     else:
         input_video = DEFAULT_INPUT_VIDEO
+
+    # Use the Whisper model from the command line if one was provided.
+    # Otherwise, use the beginner-friendly default model.
+    if len(sys.argv) > 2:
+        whisper_model = sys.argv[2]
+    else:
+        whisper_model = WHISPER_MODEL
 
     # Use the video's filename without ".mp4" to create matching output filenames.
     video_name = input_video.stem
@@ -73,8 +99,10 @@ def main():
         "Output folders are ready: audio/, frames/, transcripts/, and vault folders/"
     )
     print(f"Processing video: {input_video}")
+    print(f"Using Whisper model: {whisper_model}")
 
     # Use ffmpeg to extract the video's audio into a WAV file.
+    audio_start_time = time.perf_counter()
     subprocess.run(
         [
             "ffmpeg",
@@ -85,9 +113,11 @@ def main():
         ],
         check=True,
     )
+    audio_extraction_time = time.perf_counter() - audio_start_time
     print(f"Audio extracted successfully: {output_audio}")
 
-    # Use ffmpeg to save one video frame every 5 seconds as a JPG image.
+    # Use ffmpeg to save one video frame at the configured interval.
+    frame_start_time = time.perf_counter()
     subprocess.run(
         [
             "ffmpeg",
@@ -95,11 +125,12 @@ def main():
             "-i",
             str(input_video),
             "-vf",
-            "fps=1/5",
+            f"fps=1/{FRAME_INTERVAL_SECONDS}",
             str(output_frame_pattern),
         ],
         check=True,
     )
+    frame_extraction_time = time.perf_counter() - frame_start_time
     print(f"Frames extracted successfully: {output_frame_pattern}")
 
     # Count the actual frame files that ffmpeg created.
@@ -113,9 +144,10 @@ def main():
     print(f"Found {total_frames} extracted frame file(s).")
 
     # Load the Faster Whisper speech-to-text model.
-    print("Loading Faster Whisper model...")
-    model = WhisperModel("base")
-    print("Faster Whisper model loaded successfully.")
+    transcription_start_time = time.perf_counter()
+    print(f"Loading Faster Whisper model: {whisper_model}")
+    model = WhisperModel(whisper_model)
+    print(f"Faster Whisper model loaded successfully: {whisper_model}")
 
     # Transcribe the extracted audio file.
     print(f"Transcribing audio: {output_audio}")
@@ -134,6 +166,7 @@ def main():
                     segment.start,
                     total_frames,
                     video_frames_folder,
+                    FRAME_INTERVAL_SECONDS,
                 ),
             }
         )
@@ -147,14 +180,18 @@ def main():
                 f"[{segment['start_time']} - {segment['end_time']}] {segment['text']}\n"
             )
 
+    transcription_time = time.perf_counter() - transcription_start_time
     print(f"Transcript saved successfully: {output_transcript}")
 
     # Create a JSON file that connects the video, audio, transcript, frames, and segments.
+    json_start_time = time.perf_counter()
     coalesced_data = {
         "video_file": str(input_video),
         "audio_file": str(output_audio),
         "transcript_file": str(output_transcript),
         "frames_folder": str(video_frames_folder),
+        "frame_interval_seconds": FRAME_INTERVAL_SECONDS,
+        "whisper_model": whisper_model,
         "segments": transcript_segments,
     }
 
@@ -162,9 +199,11 @@ def main():
     with output_json.open("w", encoding="utf-8") as json_file:
         json.dump(coalesced_data, json_file, indent=2)
 
+    json_generation_time = time.perf_counter() - json_start_time
     print(f"Coalesced JSON saved successfully: {output_json}")
 
     # Create an Obsidian-ready markdown note for this meeting.
+    markdown_start_time = time.perf_counter()
     print(f"Creating Obsidian note: {output_note}")
 
     # This placeholder can be replaced later with an AI-generated or human-written summary.
@@ -190,6 +229,8 @@ def main():
         note_file.write("attendees: []\n")
         note_file.write(f"coalesced_file: {output_json}\n")
         note_file.write(f"frames_folder: {video_frames_folder}/\n")
+        note_file.write(f"frame_interval_seconds: {FRAME_INTERVAL_SECONDS}\n")
+        note_file.write(f"whisper_model: {whisper_model}\n")
         note_file.write("---\n\n")
 
         note_file.write(f"# {meeting_title}\n\n")
@@ -204,7 +245,21 @@ def main():
             note_file.write(f"{segment['text']}\n\n")
             note_file.write(f"Frame: {segment['nearest_frame']}\n\n")
 
+    markdown_generation_time = time.perf_counter() - markdown_start_time
     print(f"Obsidian note saved successfully: {output_note}")
+
+    # Stop the total pipeline timer after all work is complete.
+    total_pipeline_time = time.perf_counter() - total_start_time
+
+    # Print a clean timing summary so it is easy to see which steps took time.
+    print("\n[Timing]")
+    print(f"Whisper model: {whisper_model}")
+    print(f"Audio extraction: {audio_extraction_time:.2f}s")
+    print(f"Frame extraction: {frame_extraction_time:.2f}s")
+    print(f"Transcription: {transcription_time:.2f}s")
+    print(f"JSON generation: {json_generation_time:.2f}s")
+    print(f"Markdown generation: {markdown_generation_time:.2f}s")
+    print(f"Total pipeline: {total_pipeline_time:.2f}s")
 
     # Let the user know the whole process completed.
     print("Video processing complete.")

@@ -21,3 +21,9 @@ videos/
 
 # Mac files
 .DS_Store
+
+# Watcher state
+processed_videos.txt
+
+# Generated vault outputs
+vault/
