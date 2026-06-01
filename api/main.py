@@ -5,7 +5,9 @@ import subprocess
 
 from fastapi import FastAPI, UploadFile, File
 from pydantic import BaseModel
+from qdrant_client import QdrantClient
 import requests
+from sentence_transformers import SentenceTransformer
 
 from api.models import ActionItem, Decision, MeetingSummary
 
@@ -15,12 +17,21 @@ VIDEOS_DIR = Path("videos")
 SUMMARY_NOTES_DIR = Path("vault/meetings/summaries")
 OLLAMA_URL = "http://localhost:11434/api/generate"
 OLLAMA_MODEL = "qwen2.5:3b"
+QDRANT_URL = "http://localhost:6333"
+QDRANT_COLLECTION = "team_memory"
+EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
+TOP_K_RESULTS = 3
 VIDEOS_DIR.mkdir(exist_ok=True)
 
 
 class SummarizeRequest(BaseModel):
     # The path to a transcript text file, such as transcripts/sample_meeting.txt.
     transcript_file: str
+
+
+class AskRequest(BaseModel):
+    # The user's question about indexed meeting summaries.
+    question: str
 
 
 def get_first_sentence(transcript_text: str) -> str:
@@ -192,6 +203,51 @@ def save_summary_note(meeting_summary: MeetingSummary, transcript_path: Path):
     print(f"Markdown summary saved to: {summary_note_path}")
 
 
+def ask_ollama(question: str, context: str) -> str:
+    # Build a prompt that asks Ollama for a direct, context-only answer.
+    prompt = f"""
+You are answering questions about meeting memory.
+
+Rules:
+1. Answer ONLY using the retrieved meeting context below.
+2. Prefer a direct factual answer over a general summary.
+3. If a person's name is present in the context, include that name explicitly.
+4. If the answer is not clearly present in the context, answer exactly:
+I could not find that information in the meeting memory.
+
+Examples:
+Question: Who should update API documentation?
+Good answer: Mike was assigned to update the API documentation.
+
+Question: What was decided for Phase 2?
+Good answer: The team decided to continue using Faster Whisper for Phase 2.
+
+Question:
+{question}
+
+Retrieved meeting context:
+{context}
+"""
+
+    print("Calling Ollama for question answering...")
+    print(f"Ollama model: {OLLAMA_MODEL}")
+
+    response = requests.post(
+        OLLAMA_URL,
+        json={
+            "model": OLLAMA_MODEL,
+            "prompt": prompt,
+            "stream": False,
+        },
+        timeout=120,
+    )
+    response.raise_for_status()
+
+    answer = response.json()["response"].strip()
+    print("Ollama response received.")
+    return answer
+
+
 @app.get("/")
 def home():
     return {
@@ -242,3 +298,59 @@ def summarize_transcript(request: SummarizeRequest):
 
     # Return the structured JSON response.
     return meeting_summary
+
+
+@app.post("/ask")
+def ask_question(request: AskRequest):
+    print(f"Received question: {request.question}")
+
+    # Load the same embedding model used when indexing the vault.
+    print(f"Generating embedding with model: {EMBEDDING_MODEL_NAME}")
+    embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
+    query_vector = embedding_model.encode(request.question).tolist()
+    print("Embedding generation complete.")
+
+    # Search Qdrant for the most relevant meeting summary notes.
+    print(f"Searching Qdrant collection: {QDRANT_COLLECTION}")
+    qdrant_client = QdrantClient(url=QDRANT_URL)
+    search_results = qdrant_client.query_points(
+        collection_name=QDRANT_COLLECTION,
+        query=query_vector,
+        limit=TOP_K_RESULTS,
+        with_payload=True,
+    )
+    print(f"Qdrant search returned {len(search_results.points)} result(s).")
+
+    context_parts = []
+    sources = []
+
+    # Build context for Ollama and source metadata for the API response.
+    for result in search_results.points:
+        payload = result.payload or {}
+        text = payload.get("text", "")
+        file_name = payload.get("file_name")
+        file_path = payload.get("file_path")
+
+        context_parts.append(
+            f"Source: {file_name}\n"
+            f"Path: {file_path}\n"
+            f"Text:\n{text}"
+        )
+
+        sources.append(
+            {
+                "score": result.score,
+                "file_name": file_name,
+                "file_path": file_path,
+            }
+        )
+
+    retrieved_context = "\n\n---\n\n".join(context_parts)
+
+    # Ask Ollama to answer using the retrieved context.
+    answer = ask_ollama(request.question, retrieved_context)
+
+    return {
+        "answer": answer,
+        "sources": sources,
+    }
