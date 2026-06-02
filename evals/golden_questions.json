@@ -1,0 +1,38 @@
+[
+  {
+    "question": "What decisions were made about Qdrant?",
+    "expected_source": "summary_infrastructure_meeting.md"
+  },
+  {
+    "question": "Who is responsible for deployment documentation?",
+    "expected_source": "summary_infrastructure_meeting.md"
+  },
+  {
+    "question": "What is the open question about cloud deployment?",
+    "expected_source": "summary_infrastructure_meeting.md"
+  },
+  {
+    "question": "What transcription model is being used for Phase 2?",
+    "expected_source": "summary_ai_models_meeting.md"
+  },
+  {
+    "question": "Who is comparing Whisper model sizes?",
+    "expected_source": "summary_ai_models_meeting.md"
+  },
+  {
+    "question": "What is the open question about GPU acceleration?",
+    "expected_source": "summary_ai_models_meeting.md"
+  },
+  {
+    "question": "Who is creating dashboard wireframes?",
+    "expected_source": "summary_product_strategy_meeting.md"
+  },
+  {
+    "question": "What is the product's initial focus?",
+    "expected_source": "summary_product_strategy_meeting.md"
+  },
+  {
+    "question": "What open question exists about the product?",
+    "expected_source": "summary_product_strategy_meeting.md"
+  }
+]
