@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+import re
 import shutil
 import subprocess
 
@@ -21,6 +22,7 @@ QDRANT_URL = "http://localhost:6333"
 QDRANT_COLLECTION = "team_memory"
 EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
 TOP_K_RESULTS = 3
+MIN_KEYWORD_MATCH_RATIO = 0.25
 VIDEOS_DIR.mkdir(exist_ok=True)
 
 
@@ -44,6 +46,81 @@ def get_first_sentence(transcript_text: str) -> str:
     return "No transcript text was found."
 
 
+def clean_transcript_text(transcript_text: str) -> str:
+    # Clean common transcript noise before sending text to summarization.
+    cleaned_lines = []
+
+    for line in transcript_text.splitlines():
+        clean_line = line.strip()
+
+        # Skip metadata lines from the transcript file.
+        if not clean_line or clean_line.lower().startswith("detected language:"):
+            continue
+
+        # Remove timestamp ranges like [00:00:01 - 00:00:04].
+        clean_line = re.sub(
+            r"^\[\d{2}:\d{2}:\d{2}\s*-\s*\d{2}:\d{2}:\d{2}\]\s*",
+            "",
+            clean_line,
+        )
+
+        # Correct a few common speech-to-text mistakes in technical terms.
+        clean_line = re.sub(r"\bqdrin\b", "Qdrant", clean_line, flags=re.IGNORECASE)
+        clean_line = re.sub(r"\bqdrant\b", "Qdrant", clean_line, flags=re.IGNORECASE)
+        clean_line = re.sub(r"\bco-pilot\b", "copilot", clean_line, flags=re.IGNORECASE)
+
+        if clean_line:
+            cleaned_lines.append(clean_line)
+
+    return "\n".join(cleaned_lines)
+
+
+def get_source_timestamp(line: str):
+    # Capture a timestamp range if the original transcript line has one.
+    timestamp_match = re.match(
+        r"^\[(\d{2}:\d{2}:\d{2}\s*-\s*\d{2}:\d{2}:\d{2})\]",
+        line.strip(),
+    )
+
+    if timestamp_match:
+        return timestamp_match.group(1)
+
+    return None
+
+
+def guess_action_owner(clean_line: str):
+    # Very simple owner guess: "Mike will ..." becomes owner "Mike".
+    owner_match = re.match(r"^([A-Z][a-z]+)\s+will\b", clean_line)
+
+    if owner_match:
+        return owner_match.group(1)
+
+    return None
+
+
+def extract_key_topics(cleaned_transcript_text: str):
+    # Keep fallback topics grounded in words that actually appear in the transcript.
+    topic_keywords = {
+        "Qdrant": "qdrant",
+        "Ollama": "ollama",
+        "FastAPI": "fastapi",
+        "API documentation": "api documentation",
+        "Faster Whisper": "faster whisper",
+        "Whisper": "whisper",
+        "copilot": "copilot",
+        "Phase 2": "phase 2",
+    }
+
+    lower_text = cleaned_transcript_text.lower()
+    topics = []
+
+    for topic_name, keyword in topic_keywords.items():
+        if keyword in lower_text:
+            topics.append(topic_name)
+
+    return topics
+
+
 def create_rule_based_summary(transcript_path: Path, transcript_text: str) -> MeetingSummary:
     # These simple keyword lists let us do beginner-friendly rule-based extraction.
     decision_keywords = ["decide", "decision", "agreed"]
@@ -54,9 +131,12 @@ def create_rule_based_summary(transcript_path: Path, transcript_text: str) -> Me
     action_items = []
     open_questions = []
 
+    cleaned_transcript_text = clean_transcript_text(transcript_text)
+
     # Check each transcript line for simple decision, action item, and question clues.
     for line in transcript_text.splitlines():
-        clean_line = line.strip()
+        source_timestamp = get_source_timestamp(line)
+        clean_line = clean_transcript_text(line)
 
         # Skip blank lines so we do not add empty items.
         if not clean_line:
@@ -68,7 +148,7 @@ def create_rule_based_summary(transcript_path: Path, transcript_text: str) -> Me
             decisions.append(
                 Decision(
                     decision=clean_line,
-                    source_timestamp=None,
+                    source_timestamp=source_timestamp,
                 )
             )
 
@@ -76,9 +156,9 @@ def create_rule_based_summary(transcript_path: Path, transcript_text: str) -> Me
             action_items.append(
                 ActionItem(
                     task=clean_line,
-                    owner=None,
+                    owner=guess_action_owner(clean_line),
                     due_date=None,
-                    source_timestamp=None,
+                    source_timestamp=source_timestamp,
                 )
             )
 
@@ -87,12 +167,8 @@ def create_rule_based_summary(transcript_path: Path, transcript_text: str) -> Me
 
     return MeetingSummary(
         title=transcript_path.stem.replace("_", " ").title(),
-        tldr=get_first_sentence(transcript_text),
-        key_topics=[
-            "teamwork",
-            "collaboration",
-            "scheduling",
-        ],
+        tldr=get_first_sentence(cleaned_transcript_text),
+        key_topics=extract_key_topics(cleaned_transcript_text),
         decisions=decisions,
         action_items=action_items,
         open_questions=open_questions,
@@ -104,6 +180,8 @@ def create_rule_based_summary(transcript_path: Path, transcript_text: str) -> Me
 
 
 def create_ollama_summary(transcript_path: Path, transcript_text: str) -> MeetingSummary:
+    cleaned_transcript_text = clean_transcript_text(transcript_text)
+
     # Ask Ollama to return JSON that matches our MeetingSummary shape.
     prompt = f"""
 You are summarizing a meeting transcript.
@@ -112,13 +190,21 @@ Return only valid JSON with these keys:
 title, tldr, key_topics, decisions, action_items, open_questions, tags
 
 Rules:
-- key_topics, decisions, action_items, open_questions, and tags must be lists.
-- each decision must be an object with decision and source_timestamp.
-- each action item must be an object with task, owner, due_date, and source_timestamp.
-- use null when owner, due_date, or source_timestamp is unknown.
+1. Clean the transcript before summarizing.
+2. Correct obvious technical term mistakes:
+   - QDrin, Qdrin, and QDrant should become Qdrant.
+   - co-pilot should become copilot.
+3. Extract clean full-sentence items, not timestamp fragments.
+4. Preserve owner names when action items are present.
+5. Do not invent generic topics like teamwork or collaboration unless they are actually relevant in the transcript.
+6. key_topics, decisions, action_items, open_questions, and tags must be lists.
+7. each decision must be an object with decision and source_timestamp.
+8. each action item must be an object with task, owner, due_date, and source_timestamp.
+9. use null when owner, due_date, or source_timestamp is unknown.
+10. Keep all text concise and factual.
 
-Transcript:
-{transcript_text}
+Cleaned transcript:
+{cleaned_transcript_text}
 """
 
     print("Calling Ollama for meeting summary...")
@@ -142,7 +228,7 @@ Transcript:
 
     # Add safe defaults in case the model leaves out optional-looking fields.
     summary_data.setdefault("title", transcript_path.stem.replace("_", " ").title())
-    summary_data.setdefault("tldr", get_first_sentence(transcript_text))
+    summary_data.setdefault("tldr", get_first_sentence(cleaned_transcript_text))
     summary_data.setdefault("key_topics", [])
     summary_data.setdefault("decisions", [])
     summary_data.setdefault("action_items", [])
@@ -175,7 +261,12 @@ def save_summary_note(meeting_summary: MeetingSummary, transcript_path: Path):
         summary_file.write("## Decisions\n\n")
         if meeting_summary.decisions:
             for decision in meeting_summary.decisions:
-                summary_file.write(f"- {decision.decision}\n")
+                if decision.source_timestamp:
+                    summary_file.write(
+                        f"- {decision.decision} ({decision.source_timestamp})\n"
+                    )
+                else:
+                    summary_file.write(f"- {decision.decision}\n")
         else:
             summary_file.write("- None found.\n")
         summary_file.write("\n")
@@ -183,7 +274,23 @@ def save_summary_note(meeting_summary: MeetingSummary, transcript_path: Path):
         summary_file.write("## Action Items\n\n")
         if meeting_summary.action_items:
             for action_item in meeting_summary.action_items:
-                summary_file.write(f"- {action_item.task}\n")
+                details = []
+
+                if action_item.owner:
+                    details.append(f"Owner: {action_item.owner}")
+
+                if action_item.due_date:
+                    details.append(f"Due: {action_item.due_date}")
+
+                if action_item.source_timestamp:
+                    details.append(f"Source: {action_item.source_timestamp}")
+
+                if details:
+                    summary_file.write(
+                        f"- {action_item.task} ({'; '.join(details)})\n"
+                    )
+                else:
+                    summary_file.write(f"- {action_item.task}\n")
         else:
             summary_file.write("- None found.\n")
         summary_file.write("\n")
@@ -209,10 +316,24 @@ def ask_ollama(question: str, context: str) -> str:
 You are answering questions about meeting memory.
 
 Rules:
-1. Answer ONLY using the retrieved meeting context below.
-2. Prefer a direct factual answer over a general summary.
-3. If a person's name is present in the context, include that name explicitly.
-4. If the answer is not clearly present in the context, answer exactly:
+1. Use ONLY the provided sources.
+2. Search across ALL sources, not just the first one.
+3. If multiple sources contain relevant information, combine them.
+4. Include names and owners exactly as written in the source.
+5. Prefer direct factual answers over summaries.
+6. Do not guess or add information that is not in the sources.
+7. Answer using relevant context even if the wording is not exact.
+8. Treat "decided", "agreed", "standardize", "focus on", and "next milestone" as decision signals.
+9. Treat markdown section headings like "## Decisions", "## Action Items", and "## Open Questions" as highly reliable evidence.
+10. Do not say the information is missing if a relevant source contains an item under a matching section.
+11. For questions about "all", "what decisions", "what action items", or "open questions", list all relevant items found across all sources.
+12. For questions like "summarize all discussions about X", summarize matching source content about X instead of requiring the exact phrase "discussion about X".
+13. Treat SOURCE 1 as the primary source because it has the highest retrieval score.
+14. Use lower-ranked sources only if they clearly mention the same topic as the user question.
+15. If the question asks about a specific topic, do not include unrelated decisions, action items, or open questions from other sources.
+16. For "summarize all discussions about product strategy", focus only on product roadmap, executive copilot, dashboard, user interviews, meeting recordings, and web vs desktop application.
+17. Keep answers concise and directly tied to the user's topic.
+18. If the answer is truly unrelated to all sources, answer exactly:
 I could not find that information in the meeting memory.
 
 Examples:
@@ -222,10 +343,13 @@ Good answer: Mike was assigned to update the API documentation.
 Question: What was decided for Phase 2?
 Good answer: The team decided to continue using Faster Whisper for Phase 2.
 
+Question: What decisions were made about Qdrant?
+Good answer: The team decided to standardize on Qdrant as the vector database.
+
 Question:
 {question}
 
-Retrieved meeting context:
+Retrieved sources:
 {context}
 """
 
@@ -246,6 +370,106 @@ Retrieved meeting context:
     answer = response.json()["response"].strip()
     print("Ollama response received.")
     return answer
+
+
+def extract_question_keywords(question: str):
+    # Remove common words so we keep the useful topic words from the question.
+    common_words = {
+        "what",
+        "who",
+        "where",
+        "when",
+        "why",
+        "how",
+        "all",
+        "about",
+        "the",
+        "is",
+        "are",
+        "were",
+        "was",
+        "did",
+        "do",
+        "does",
+        "summarize",
+        "discussions",
+    }
+
+    words = re.findall(r"[a-zA-Z0-9]+", question.lower())
+
+    return [
+        word
+        for word in words
+        if len(word) > 3 and word not in common_words
+    ]
+
+
+def get_payload_search_text(payload):
+    # Search for keywords across the most useful source fields.
+    file_name = payload.get("file_name", "")
+    text = payload.get("text", "")
+
+    # The markdown text usually contains title and tags, so this keeps things simple.
+    return f"{file_name}\n{text}".lower()
+
+
+def count_keyword_matches(search_text: str, question_keywords):
+    # Count how many unique question keywords appear in this source.
+    return sum(1 for keyword in question_keywords if keyword in search_text)
+
+
+def select_sources_for_question(search_points, question: str):
+    # Always include the top-ranked source, then filter lower-ranked sources.
+    if not search_points:
+        return []
+
+    question_keywords = extract_question_keywords(question)
+    selected_points = []
+
+    print(f"Question keywords for source filtering: {question_keywords}")
+
+    for index, point in enumerate(search_points):
+        payload = point.payload or {}
+        file_name = payload.get("file_name")
+        search_text = get_payload_search_text(payload)
+        keyword_match_count = count_keyword_matches(search_text, question_keywords)
+
+        if question_keywords:
+            keyword_match_ratio = keyword_match_count / len(question_keywords)
+        else:
+            keyword_match_ratio = 0
+
+        # The first result is the highest-ranked source, so always keep it.
+        if index == 0:
+            selected_points.append(point)
+            print(
+                f"Source: {file_name} | "
+                f"Qdrant score: {point.score} | "
+                f"Keyword matches: {keyword_match_count} | "
+                "Decision: keep top-ranked source"
+            )
+            continue
+
+        # Keep extra sources only when they clearly match the question topic.
+        should_keep = (
+            keyword_match_count > 0
+            and keyword_match_ratio >= MIN_KEYWORD_MATCH_RATIO
+        )
+
+        if should_keep:
+            selected_points.append(point)
+            decision = "keep keyword-relevant source"
+        else:
+            decision = "discard not enough keyword overlap"
+
+        print(
+            f"Source: {file_name} | "
+            f"Qdrant score: {point.score} | "
+            f"Keyword matches: {keyword_match_count} | "
+            f"Decision: {decision}"
+        )
+
+    return selected_points
 
 
 @app.get("/")
@@ -321,20 +545,31 @@ def ask_question(request: AskRequest):
     )
     print(f"Qdrant search returned {len(search_results.points)} result(s).")
 
+    selected_points = select_sources_for_question(
+        search_results.points,
+        request.question,
+    )
+
+    print("Selected sources for prompt:")
+    for point in selected_points:
+        payload = point.payload or {}
+        print(f"- {payload.get('file_name')} (score: {point.score})")
+
     context_parts = []
     sources = []
 
     # Build context for Ollama and source metadata for the API response.
-    for result in search_results.points:
+    for source_number, result in enumerate(selected_points, start=1):
         payload = result.payload or {}
         text = payload.get("text", "")
         file_name = payload.get("file_name")
         file_path = payload.get("file_path")
 
+        # Give the model the full text of each source with clear source labels.
         context_parts.append(
-            f"Source: {file_name}\n"
-            f"Path: {file_path}\n"
-            f"Text:\n{text}"
+            f"SOURCE {source_number}:\n"
+            f"File: {file_name}\n"
+            f"Content:\n{text}"
         )
 
         sources.append(
@@ -345,7 +580,7 @@ def ask_question(request: AskRequest):
             }
         )
 
-    retrieved_context = "\n\n---\n\n".join(context_parts)
+    retrieved_context = "\n\n".join(context_parts)
 
     # Ask Ollama to answer using the retrieved context.
     answer = ask_ollama(request.question, retrieved_context)
