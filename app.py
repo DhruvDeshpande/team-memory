@@ -1,16 +1,64 @@
+import json
 from pathlib import Path
+import sqlite3
+from datetime import datetime
 
 import streamlit as st
 import requests
 
 API_URL = "http://127.0.0.1:8000/ask"
 SUMMARY_NOTES_DIR = Path("vault/meetings/summaries")
+FEEDBACK_DB = Path("feedback.db")
 
 st.set_page_config(
     page_title="Team Memory",
     page_icon="🧠",
     layout="wide"
 )
+
+
+def create_feedback_table():
+    # Create the feedback table if this is the first time the app is running.
+    with sqlite3.connect(FEEDBACK_DB) as connection:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS feedback (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                question TEXT,
+                answer TEXT,
+                sources TEXT,
+                rating TEXT,
+                created_at TEXT
+            )
+            """
+        )
+
+
+def save_feedback(rating):
+    # Store the user's feedback for the current answer.
+    sources_json = json.dumps(st.session_state.sources)
+    created_at = datetime.now().isoformat(timespec="seconds")
+
+    with sqlite3.connect(FEEDBACK_DB) as connection:
+        connection.execute(
+            """
+            INSERT INTO feedback (
+                question,
+                answer,
+                sources,
+                rating,
+                created_at
+            )
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                st.session_state.question,
+                st.session_state.answer,
+                sources_json,
+                rating,
+                created_at,
+            ),
+        )
 
 
 def load_source_markdown(source):
@@ -30,6 +78,12 @@ def load_source_markdown(source):
 
     return source_path.read_text(encoding="utf-8"), None
 
+
+create_feedback_table()
+
+
+if "question" not in st.session_state:
+    st.session_state.question = None
 
 if "answer" not in st.session_state:
     st.session_state.answer = None
@@ -62,6 +116,7 @@ with left_column:
 
                 data = response.json()
 
+                st.session_state.question = question
                 st.session_state.answer = data["answer"]
                 st.session_state.sources = data["sources"]
 
@@ -71,6 +126,18 @@ with left_column:
     if st.session_state.answer:
         st.subheader("Answer")
         st.write(st.session_state.answer)
+
+        feedback_left, feedback_right = st.columns(2)
+
+        with feedback_left:
+            if st.button("👍 Helpful"):
+                save_feedback("positive")
+                st.success("Feedback saved.")
+
+        with feedback_right:
+            if st.button("👎 Not helpful"):
+                save_feedback("negative")
+                st.success("Feedback saved.")
 
     if st.session_state.sources:
         st.subheader("Sources")

@@ -9,6 +9,7 @@ from pydantic import BaseModel
 from qdrant_client import QdrantClient
 import requests
 from sentence_transformers import SentenceTransformer
+from starlette.responses import StreamingResponse
 
 from api.models import ActionItem, Decision, MeetingSummary
 
@@ -312,7 +313,30 @@ def save_summary_note(meeting_summary: MeetingSummary, transcript_path: Path):
 
 def ask_ollama(question: str, context: str) -> str:
     # Build a prompt that asks Ollama for a direct, context-only answer.
-    prompt = f"""
+    prompt = build_answer_prompt(question, context)
+
+    print("Calling Ollama for question answering...")
+    print(f"Ollama model: {OLLAMA_MODEL}")
+
+    response = requests.post(
+        OLLAMA_URL,
+        json={
+            "model": OLLAMA_MODEL,
+            "prompt": prompt,
+            "stream": False,
+        },
+        timeout=120,
+    )
+    response.raise_for_status()
+
+    answer = response.json()["response"].strip()
+    print("Ollama response received.")
+    return answer
+
+
+def build_answer_prompt(question: str, context: str) -> str:
+    # Keep the answer prompt in one helper so /ask and /query use the same logic.
+    return f"""
 You are answering questions about meeting memory.
 
 Rules:
@@ -352,24 +376,6 @@ Question:
 Retrieved sources:
 {context}
 """
-
-    print("Calling Ollama for question answering...")
-    print(f"Ollama model: {OLLAMA_MODEL}")
-
-    response = requests.post(
-        OLLAMA_URL,
-        json={
-            "model": OLLAMA_MODEL,
-            "prompt": prompt,
-            "stream": False,
-        },
-        timeout=120,
-    )
-    response.raise_for_status()
-
-    answer = response.json()["response"].strip()
-    print("Ollama response received.")
-    return answer
 
 
 def extract_question_keywords(question: str):
@@ -472,6 +478,63 @@ def select_sources_for_question(search_points, question: str):
     return selected_points
 
 
+def retrieve_meeting_sources(question: str):
+    # Load the same embedding model used when indexing the vault.
+    print(f"Generating embedding with model: {EMBEDDING_MODEL_NAME}")
+    embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
+    query_vector = embedding_model.encode(question).tolist()
+    print("Embedding generation complete.")
+
+    # Search Qdrant for the most relevant meeting summary notes.
+    print(f"Searching Qdrant collection: {QDRANT_COLLECTION}")
+    qdrant_client = QdrantClient(url=QDRANT_URL)
+    search_results = qdrant_client.query_points(
+        collection_name=QDRANT_COLLECTION,
+        query=query_vector,
+        limit=TOP_K_RESULTS,
+        with_payload=True,
+    )
+    print(f"Qdrant search returned {len(search_results.points)} result(s).")
+    return search_results.points
+
+
+def build_primary_source_context(search_points):
+    # Use only the highest-scoring source in the answer prompt.
+    if not search_points:
+        print("Selected primary source: none")
+        return ""
+
+    primary_source = search_points[0]
+    primary_payload = primary_source.payload or {}
+    primary_file_name = primary_payload.get("file_name")
+    primary_text = primary_payload.get("text", "")
+
+    print(f"Selected primary source: {primary_file_name}")
+
+    return (
+        "SOURCE 1:\n"
+        f"File: {primary_file_name}\n"
+        f"Content:\n{primary_text}"
+    )
+
+
+def build_sources_response(search_points):
+    # Return the top retrieved sources for transparency.
+    sources = []
+
+    for result in search_points:
+        payload = result.payload or {}
+        sources.append(
+            {
+                "score": result.score,
+                "file_name": payload.get("file_name"),
+                "file_path": payload.get("file_path"),
+            }
+        )
+
+    return sources
+
+
 @app.get("/")
 def home():
     return {
@@ -528,55 +591,9 @@ def summarize_transcript(request: SummarizeRequest):
 def ask_question(request: AskRequest):
     print(f"Received question: {request.question}")
 
-    # Load the same embedding model used when indexing the vault.
-    print(f"Generating embedding with model: {EMBEDDING_MODEL_NAME}")
-    embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
-    query_vector = embedding_model.encode(request.question).tolist()
-    print("Embedding generation complete.")
-
-    # Search Qdrant for the most relevant meeting summary notes.
-    print(f"Searching Qdrant collection: {QDRANT_COLLECTION}")
-    qdrant_client = QdrantClient(url=QDRANT_URL)
-    search_results = qdrant_client.query_points(
-        collection_name=QDRANT_COLLECTION,
-        query=query_vector,
-        limit=TOP_K_RESULTS,
-        with_payload=True,
-    )
-    print(f"Qdrant search returned {len(search_results.points)} result(s).")
-
-    context_parts = []
-    sources = []
-
-    # Return the top retrieved sources for transparency.
-    for result in search_results.points:
-        payload = result.payload or {}
-        sources.append(
-            {
-                "score": result.score,
-                "file_name": payload.get("file_name"),
-                "file_path": payload.get("file_path"),
-            }
-        )
-
-    # Use only the highest-scoring source in the Ollama prompt.
-    if search_results.points:
-        primary_source = search_results.points[0]
-        primary_payload = primary_source.payload or {}
-        primary_file_name = primary_payload.get("file_name")
-        primary_text = primary_payload.get("text", "")
-
-        print(f"Selected primary source: {primary_file_name}")
-
-        context_parts.append(
-            "SOURCE 1:\n"
-            f"File: {primary_file_name}\n"
-            f"Content:\n{primary_text}"
-        )
-    else:
-        print("Selected primary source: none")
-
-    retrieved_context = "\n\n".join(context_parts)
+    search_points = retrieve_meeting_sources(request.question)
+    sources = build_sources_response(search_points)
+    retrieved_context = build_primary_source_context(search_points)
 
     # Ask Ollama to answer using the retrieved context.
     answer = ask_ollama(request.question, retrieved_context)
@@ -585,3 +602,50 @@ def ask_question(request: AskRequest):
         "answer": answer,
         "sources": sources,
     }
+
+
+def stream_ollama_answer(prompt: str):
+    print("Streaming started.")
+
+    with requests.post(
+        OLLAMA_URL,
+        json={
+            "model": OLLAMA_MODEL,
+            "prompt": prompt,
+            "stream": True,
+        },
+        stream=True,
+        timeout=120,
+    ) as response:
+        response.raise_for_status()
+
+        # Ollama streams one JSON object per line.
+        for line in response.iter_lines():
+            if not line:
+                continue
+
+            data = json.loads(line.decode("utf-8"))
+            text_chunk = data.get("response", "")
+
+            if text_chunk:
+                yield f"data: {text_chunk}\n\n"
+
+            if data.get("done"):
+                break
+
+    print("Streaming complete.")
+    yield "data: [DONE]\n\n"
+
+
+@app.post("/query")
+def query_stream(request: AskRequest):
+    print(f"Received query: {request.question}")
+
+    search_points = retrieve_meeting_sources(request.question)
+    retrieved_context = build_primary_source_context(search_points)
+    prompt = build_answer_prompt(request.question, retrieved_context)
+
+    return StreamingResponse(
+        stream_ollama_answer(prompt),
+        media_type="text/event-stream",
+    )
