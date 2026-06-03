@@ -410,6 +410,12 @@ def extract_question_keywords(question: str):
     ]
 
 
+def extract_citation_keywords(question: str, answer: str):
+    # Use important words from both the question and answer to find a transcript line.
+    combined_text = f"{question} {answer}"
+    return extract_question_keywords(combined_text)
+
+
 def get_payload_search_text(payload):
     # Search for keywords across the most useful source fields.
     file_name = payload.get("file_name", "")
@@ -518,17 +524,81 @@ def build_primary_source_context(search_points):
     )
 
 
-def build_sources_response(search_points):
+def extract_timestamp_from_text(text):
+    # Look for timestamps such as [00:00:31], 00:00:31, or 00:00:31 - 00:00:34.
+    timestamp_patterns = [
+        r"\[(\d{2}:\d{2}:\d{2})\]",
+        r"(\d{2}:\d{2}:\d{2})\s*-\s*\d{2}:\d{2}:\d{2}",
+        r"\b(\d{2}:\d{2}:\d{2})\b",
+    ]
+
+    for pattern in timestamp_patterns:
+        timestamp_match = re.search(pattern, text)
+
+        if timestamp_match:
+            return timestamp_match.group(1)
+
+    return None
+
+
+def infer_transcript_path_from_source(file_name):
+    # summary_infrastructure_meeting.md becomes transcripts/infrastructure_meeting.txt.
+    if not file_name:
+        return None
+
+    transcript_name = file_name
+
+    if transcript_name.startswith("summary_"):
+        transcript_name = transcript_name.replace("summary_", "", 1)
+
+    transcript_name = transcript_name.replace(".md", ".txt")
+    return Path("transcripts") / transcript_name
+
+
+def find_timestamp_in_transcript(file_name, question: str, answer: str):
+    transcript_path = infer_transcript_path_from_source(file_name)
+    print(f"Inferred transcript path: {transcript_path}")
+
+    if not transcript_path or not transcript_path.exists():
+        print("Matched citation line: none")
+        print("Extracted timestamp: None")
+        return None
+
+    citation_keywords = extract_citation_keywords(question, answer)
+    print(f"Citation keywords: {citation_keywords}")
+
+    for line in transcript_path.read_text(encoding="utf-8").splitlines():
+        lower_line = line.lower()
+
+        # Match the first transcript line that contains any important keyword.
+        if any(keyword in lower_line for keyword in citation_keywords):
+            timestamp = extract_timestamp_from_text(line)
+            print(f"Matched citation line: {line}")
+            print(f"Extracted timestamp: {timestamp}")
+            return timestamp
+
+    print("Matched citation line: none")
+    print("Extracted timestamp: None")
+    return None
+
+
+def build_sources_response(search_points, question: str, answer: str):
     # Return the top retrieved sources for transparency.
     sources = []
 
     for result in search_points:
         payload = result.payload or {}
+        file_name = payload.get("file_name")
         sources.append(
             {
                 "score": result.score,
-                "file_name": payload.get("file_name"),
+                "file_name": file_name,
                 "file_path": payload.get("file_path"),
+                "timestamp": find_timestamp_in_transcript(
+                    file_name,
+                    question,
+                    answer,
+                ),
             }
         )
 
@@ -592,11 +662,11 @@ def ask_question(request: AskRequest):
     print(f"Received question: {request.question}")
 
     search_points = retrieve_meeting_sources(request.question)
-    sources = build_sources_response(search_points)
     retrieved_context = build_primary_source_context(search_points)
 
     # Ask Ollama to answer using the retrieved context.
     answer = ask_ollama(request.question, retrieved_context)
+    sources = build_sources_response(search_points, request.question, answer)
 
     return {
         "answer": answer,

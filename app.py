@@ -143,10 +143,12 @@ with left_column:
         st.subheader("Sources")
 
         for source in st.session_state.sources:
-            st.write(
-                f"📄 {source['file_name']} "
-                f"(score: {source['score']:.3f})"
-            )
+            source_label = f"📄 {source['file_name']}"
+
+            if source.get("timestamp"):
+                source_label += f" @ {source['timestamp']}"
+
+            st.write(f"{source_label} (score: {source['score']:.3f})")
 
 
 with right_column:
