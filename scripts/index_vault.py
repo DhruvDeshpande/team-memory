@@ -12,6 +12,51 @@ COLLECTION_NAME = "team_memory"
 SUMMARY_NOTES_FOLDER = Path("vault/meetings/summaries")
 
 
+def infer_title(markdown_text, fallback_title):
+    # Use the first markdown heading as the meeting title if one exists.
+    for line in markdown_text.splitlines():
+        clean_line = line.strip()
+
+        if clean_line.startswith("# "):
+            return clean_line.replace("# ", "", 1).strip()
+
+    return fallback_title
+
+
+def extract_tags(markdown_text):
+    # Read bullet points under the "## Tags" section.
+    tags = []
+    inside_tags_section = False
+
+    for line in markdown_text.splitlines():
+        clean_line = line.strip()
+
+        if clean_line == "## Tags":
+            inside_tags_section = True
+            continue
+
+        if inside_tags_section and clean_line.startswith("## "):
+            break
+
+        if inside_tags_section and clean_line.startswith("- "):
+            tags.append(clean_line.replace("- ", "", 1).strip())
+
+    return tags
+
+
+def build_enriched_text(markdown_file, title, tags, markdown_text):
+    # Add helpful metadata before the content so retrieval has more signals.
+    tags_text = ", ".join(tags) if tags else "None"
+
+    return (
+        f"File: {markdown_file.name}\n"
+        f"Title: {title}\n"
+        f"Tags: {tags_text}\n\n"
+        "Content:\n"
+        f"{markdown_text}"
+    )
+
+
 def main():
     print("Starting vault indexing...")
     print(f"Loading embedding model: {EMBEDDING_MODEL_NAME}")
@@ -53,15 +98,25 @@ def main():
         # Read the markdown note text.
         text = markdown_file.read_text(encoding="utf-8")
 
+        # Extract useful metadata from the markdown note.
+        fallback_title = markdown_file.stem.replace("_", " ").title()
+        title = infer_title(text, fallback_title)
+        tags = extract_tags(text)
+
+        # Create enriched text for embedding so retrieval can match filename, title, and tags.
+        enriched_text = build_enriched_text(markdown_file, title, tags, text)
+
         # Create an embedding vector for this note.
         print(f"Creating embedding for: {markdown_file.name}")
-        embedding = embedding_model.encode(text).tolist()
+        embedding = embedding_model.encode(enriched_text).tolist()
 
         # Store useful metadata with the vector.
         payload = {
             "file_path": str(markdown_file),
             "file_name": markdown_file.name,
             "text": text,
+            "title": title,
+            "tags": tags,
         }
 
         points.append(
