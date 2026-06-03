@@ -545,40 +545,36 @@ def ask_question(request: AskRequest):
     )
     print(f"Qdrant search returned {len(search_results.points)} result(s).")
 
-    selected_points = select_sources_for_question(
-        search_results.points,
-        request.question,
-    )
-
-    print("Selected sources for prompt:")
-    for point in selected_points:
-        payload = point.payload or {}
-        print(f"- {payload.get('file_name')} (score: {point.score})")
-
     context_parts = []
     sources = []
 
-    # Build context for Ollama and source metadata for the API response.
-    for source_number, result in enumerate(selected_points, start=1):
+    # Return the top retrieved sources for transparency.
+    for result in search_results.points:
         payload = result.payload or {}
-        text = payload.get("text", "")
-        file_name = payload.get("file_name")
-        file_path = payload.get("file_path")
-
-        # Give the model the full text of each source with clear source labels.
-        context_parts.append(
-            f"SOURCE {source_number}:\n"
-            f"File: {file_name}\n"
-            f"Content:\n{text}"
-        )
-
         sources.append(
             {
                 "score": result.score,
-                "file_name": file_name,
-                "file_path": file_path,
+                "file_name": payload.get("file_name"),
+                "file_path": payload.get("file_path"),
             }
         )
+
+    # Use only the highest-scoring source in the Ollama prompt.
+    if search_results.points:
+        primary_source = search_results.points[0]
+        primary_payload = primary_source.payload or {}
+        primary_file_name = primary_payload.get("file_name")
+        primary_text = primary_payload.get("text", "")
+
+        print(f"Selected primary source: {primary_file_name}")
+
+        context_parts.append(
+            "SOURCE 1:\n"
+            f"File: {primary_file_name}\n"
+            f"Content:\n{primary_text}"
+        )
+    else:
+        print("Selected primary source: none")
 
     retrieved_context = "\n\n".join(context_parts)
 
